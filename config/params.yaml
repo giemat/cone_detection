@@ -16,7 +16,7 @@
         model_path: "/home/ros/ws/src/cone_detection/models/Yolov8n1280.onnx"
         engine_path: "/home/ros/ws/src/cone_detection/models/Yolov8n1280.engine"
         quantized_engine_path: "/home/ros/ws/src/cone_detection/models/Yolov8n1280_INT8.engine"
-        calibration_data_path: "/home/ros/ws/src/cone_detection/calibration_data/"
+        calibration_data_path: "/home/ros/ws/src/cone_detection/small_calibration/"
         classes: [
             "seg_orange_cone", 
             "unknown_cone", 
