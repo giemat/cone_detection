@@ -124,6 +124,7 @@ private:
     Logger m_logger;
     std::vector<void *> m_buffers;
     std::vector<uint32_t> m_outputLengths{};
+    std::vector<size_t> m_outputElementSizes{};
     std::vector<nvinfer1::Dims3> m_inputDims;
     std::vector<nvinfer1::Dims> m_outputDims;
     std::vector<std::string> m_IOTensorNames;
@@ -156,6 +157,7 @@ private:
     std::vector<ModelResult> ret;                // Detection results
     std::vector<cv::cuda::GpuMat> preprocessedInputs; // Preprocessed inputs
     std::vector<float> m_featureVector;          // Inference output
+    std::vector<uint8_t> m_rawOutputBuffer;      // Scratch buffer for non-float output conversion
 
     std::vector<cv::Rect> bboxes;
     cv::Rect_<float> bbox;

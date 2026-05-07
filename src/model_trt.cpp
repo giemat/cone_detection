@@ -85,6 +85,7 @@ bool Model::loadEngine() {
     m_buffers.resize(m_engine->getNbIOTensors());
 
     m_outputLengths.clear();
+    m_outputElementSizes.clear();
     m_inputDims.clear();
     m_outputDims.clear();
     m_IOTensorNames.clear();
@@ -111,7 +112,7 @@ bool Model::loadEngine() {
             m_inputDims.emplace_back(tensorShape.d[1], tensorShape.d[2], tensorShape.d[3]);
             m_inputBatchSize = tensorShape.d[0];
         } else if (tensorType == nvinfer1::TensorIOMode::kOUTPUT) {
-            
+
             // The binding is an output
             uint32_t outputLength = 1;
             m_outputDims.push_back(tensorShape);
@@ -122,8 +123,20 @@ bool Model::loadEngine() {
                 outputLength *= tensorShape.d[j];
             }
 
+            const nvinfer1::DataType outputDataType = m_engine->getTensorDataType(tensorName);
+            size_t elementSize = sizeof(float);
+            switch (outputDataType) {
+                case nvinfer1::DataType::kFLOAT:  elementSize = sizeof(float);    break;
+                case nvinfer1::DataType::kHALF:   elementSize = sizeof(uint16_t); break;
+                case nvinfer1::DataType::kINT8:   elementSize = sizeof(int8_t);   break;
+                case nvinfer1::DataType::kINT32:  elementSize = sizeof(int32_t);  break;
+                default:
+                    RCLCPP_ERROR(rclcpp::get_logger("cone_detection"), "Unsupported output data type for tensor: %s", tensorName);
+                    return false;
+            }
+            m_outputElementSizes.push_back(elementSize);
             m_outputLengths.push_back(outputLength);
-            cudaMallocAsync(&m_buffers[i], outputLength * sizeof(float), stream);
+            cudaMallocAsync(&m_buffers[i], outputLength * elementSize, stream);
         } else {
             RCLCPP_ERROR(rclcpp::get_logger("cone_detection"), "Error, IO Tensor is neither an input or output!");
             return false;
@@ -238,7 +251,7 @@ bool Model::buildEngine() {
         const nvinfer1::ITensor* input = network->getInput(0);
         const char* inputName = input->getName();
         const nvinfer1::Dims inputDims = input->getDimensions();
-        const char* calibrationFileName = "/home/ros/ws/src/cone_detection/models/Yolov8n1280.engine.calibration";
+        const std::string calibrationFileName = m_config.quantizedEnginePath + ".calibration";
 
         m_calibrator = std::make_unique<Int8EntropyCalibrator2>(m_config.calibrationBatchSize, inputDims.d[3], inputDims.d[2],
                                                                 m_config.calibrationDataPath, calibrationFileName, inputName,
@@ -461,11 +474,33 @@ std::vector<float> &m_featureVector) {
     // Copy outputs back to CPU asynchronously
     m_featureVector.clear();
     for (int32_t outputBinding = 1; outputBinding < m_engine->getNbIOTensors(); ++outputBinding) {
-        uint32_t outputLength = m_outputLengths[outputBinding - 1];
-        m_featureVector.resize(outputLength);
-        cudaMemcpyAsync(m_featureVector.data(),
-                        static_cast<char *>(m_buffers[outputBinding]),
-                        outputLength * sizeof(float), cudaMemcpyDeviceToHost, inferenceCudaStream);
+        const uint32_t outputLength = m_outputLengths[outputBinding - 1];
+        const size_t elementSize = m_outputElementSizes[outputBinding - 1];
+        if (elementSize == sizeof(float)) {
+            m_featureVector.resize(outputLength);
+            cudaMemcpyAsync(m_featureVector.data(),
+                            static_cast<char *>(m_buffers[outputBinding]),
+                            outputLength * sizeof(float), cudaMemcpyDeviceToHost, inferenceCudaStream);
+        } else {
+            // Non-float output: copy raw bytes then convert to float
+            m_rawOutputBuffer.resize(outputLength * elementSize);
+            cudaMemcpyAsync(m_rawOutputBuffer.data(),
+                            static_cast<char *>(m_buffers[outputBinding]),
+                            outputLength * elementSize, cudaMemcpyDeviceToHost, inferenceCudaStream);
+            ConeUtil::checkCudaErrorCode(cudaStreamSynchronize(inferenceCudaStream));
+            m_featureVector.resize(outputLength);
+            if (elementSize == sizeof(int8_t)) {
+                const int8_t* src = reinterpret_cast<const int8_t*>(m_rawOutputBuffer.data());
+                for (uint32_t k = 0; k < outputLength; ++k) {
+                    m_featureVector[k] = static_cast<float>(src[k]);
+                }
+            } else if (elementSize == sizeof(int32_t)) {
+                const int32_t* src = reinterpret_cast<const int32_t*>(m_rawOutputBuffer.data());
+                for (uint32_t k = 0; k < outputLength; ++k) {
+                    m_featureVector[k] = static_cast<float>(src[k]);
+                }
+            }
+        }
     }
 
     // Synchronize the CUDA stream

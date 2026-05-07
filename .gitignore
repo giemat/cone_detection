@@ -24,7 +24,7 @@ log/
 
 # Engine model
 models/Yolov8n1280.engine
-models/Yolov8n1280.engine.calibration
+models/Yolov8n1280_INT8.engine.calibration
 models/Yolov8n1280_INT8.engine
 
 
