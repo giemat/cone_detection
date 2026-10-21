@@ -56,13 +56,44 @@ ConeDetection::ConeDetection(const rclcpp::NodeOptions &node_options)
 
 
     ModelParams params;
+    // Backend: "tensorrt" | "onnx" (ONNX Runtime, needs -DWITH_ONNXRUNTIME=ON).
+    // Both use the same GPU preprocessing and postprocessing.
+    params.backend = backendFromString(
+        this->declare_parameter<std::string>("backend", "tensorrt"));
     // If using INT8 quantization, add calibration dataset to cone_detection/calibration_data
-    params.useFP16 = this->declare_parameter<bool>("use_fp16");
+    // Precision: "fp32" | "fp16" | "int8". Empty -> legacy `use_fp16`
+    // (true -> fp16, false -> int8).
+    params.useFP16 = this->declare_parameter<bool>("use_fp16", false);
+    const std::string precision =
+        this->declare_parameter<std::string>("precision", "");
+    params.precision = precision.empty()
+        ? (params.useFP16 ? Precision::FP16 : Precision::INT8)
+        : precisionFromString(precision);
+    params.int8Fp16Fallback =
+        this->declare_parameter<bool>("int8_fp16_fallback", false);
+    params.calibrationBatchSize = static_cast<int32_t>(
+        this->declare_parameter<int>("calibration_batch_size", 64));
+    params.tagEngineWithPlatform =
+        this->declare_parameter<bool>("tag_engine_with_platform", true);
     params.enginePath = this->declare_parameter<std::string>("engine_path");
+    params.fp32EnginePath =
+        this->declare_parameter<std::string>("fp32_engine_path", "");
     params.quantizedEnginePath = this->declare_parameter<std::string>("quantized_engine_path");
     params.onnxModelPath = this->declare_parameter<std::string>("model_path");
     params.calibrationDataPath = 
         this->declare_parameter<std::string>("calibration_data_path");
+    params.onnxFp16ModelPath =
+        this->declare_parameter<std::string>("onnx.fp16_model_path", "");
+    params.onnxInt8ModelPath =
+        this->declare_parameter<std::string>("onnx.int8_model_path", "");
+    params.onnxCudaPluginPath =
+        this->declare_parameter<std::string>("onnx.cuda_plugin_path", "");
+    params.onnxCudnnConvAlgoSearch =
+        this->declare_parameter<std::string>("onnx.cudnn_conv_algo_search", "EXHAUSTIVE");
+    params.onnxIntraOpThreads = static_cast<int>(
+        this->declare_parameter<int>("onnx.intra_op_num_threads", 1));
+    params.onnxDisableCpuFallback =
+        this->declare_parameter<bool>("onnx.disable_cpu_fallback", false);
     params.classes = 
         this->declare_parameter<std::vector<std::string>>("classes");
     params.img_size = {
@@ -73,19 +104,8 @@ ConeDetection::ConeDetection(const rclcpp::NodeOptions &node_options)
     params.rect_confidence_threshold = 
         this->declare_parameter<float>("rect_confidence_threshold");
 
-    //     SessionOptions options;
-    // #ifdef USE_CUDA
-    //     options.cuda_enable = this->declare_parameter<bool>("cuda_enable");
-    // #else
-    //     options.cuda_enable = false;
-    // #endif
-    //     options.intra_op_num_threads = 
-    //         this->declare_parameter<int>("intra_op_num_threads");
-    //     options.log_severity_level = 
-    //         this->declare_parameter<int>("log_severity_level");
-
-    //     model_ = std::make_shared<Model>(options, params);
-    model_ = std::make_shared<Model>(params);
+    model_ = makeDetector(params);
+    init_benchmark();
     cone_height_ = this->declare_parameter<float>("cone_height");
     params_.max_len = this->declare_parameter<float>("max_len");
     params_.min_len = this->declare_parameter<float>("min_len");
@@ -166,6 +186,10 @@ void ConeDetection::cone_detection_callback(
     const sensor_msgs::msg::Image::ConstSharedPtr &image_msg
 ) {
 
+    using BenchClock = std::chrono::steady_clock;
+    const auto callback_start = BenchClock::now();
+    FrameStats stats;
+
     #ifndef NDEBUG
         // Convert ROS image_msg to CV image
         cv_bridge::CvImagePtr cv_image_ptr;
@@ -186,11 +210,15 @@ void ConeDetection::cone_detection_callback(
         auto end = std::chrono::high_resolution_clock::now();
         auto duration = 
         std::chrono::duration_cast<std::chrono::microseconds>(end - start);
-        // std::cout << "Detection time: " << duration.count() << std::endl;
+        // Debug path: upload happens inside Model::detect(cv::Mat)
+        stats.upload_us = model_->lastTimings().upload_us;
     #else
 
-        // Upload the image to GPU memory directly from ROS message
-        cv::cuda::GpuMat cuda_image;
+        // Upload the image to GPU memory directly from ROS message.
+        // cuda_image_ is a member: reused between frames, so there is no
+        // cudaMalloc per frame.
+        cv::cuda::GpuMat &cuda_image = cuda_image_;
+        const auto upload_start = std::chrono::high_resolution_clock::now();
         try {
             cv_bridge::CvImageConstPtr cv_image_const_ptr = 
                 cv_bridge::toCvShare(image_msg, sensor_msgs::image_encodings::BGR8);
@@ -200,6 +228,12 @@ void ConeDetection::cone_detection_callback(
             RCLCPP_ERROR(this->get_logger(), "cv_bridge exception: %s", e.what());
             return;
         }
+        catch (const cv::Exception& e) {
+            RCLCPP_ERROR(this->get_logger(), "GPU upload failed: %s", e.what());
+            return;
+        }
+        stats.upload_us = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::high_resolution_clock::now() - upload_start).count();
 
 
         // Detect cones
@@ -210,11 +244,17 @@ void ConeDetection::cone_detection_callback(
         auto end = std::chrono::high_resolution_clock::now();
         auto duration = 
         std::chrono::duration_cast<std::chrono::microseconds>(end - start);
-        std::cout << "Detection time: " << duration.count() << std::endl;
     #endif
+    stats.detection_time_us = duration.count();
+    stats.raw_cones = detected_cones.size();
 
     // Filter detected cones
+    start = std::chrono::high_resolution_clock::now();
     detected_cones = filter_by_px_height(detected_cones);
+    end = std::chrono::high_resolution_clock::now();
+    stats.filter_time_us =
+        std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
+    stats.filtered_cones = detected_cones.size();
 
     start = std::chrono::high_resolution_clock::now();
     
@@ -225,7 +265,8 @@ void ConeDetection::cone_detection_callback(
     end = std::chrono::high_resolution_clock::now();
     duration = 
         std::chrono::duration_cast<std::chrono::microseconds>(end - start);
-    // std::cout << "Fusion time: " << duration.count() << std::endl;
+    stats.fusion_time_us = duration.count();
+    stats.fused_candidates = cone_positions.size();
 
 #ifndef NDEBUG
     int cone_marker_id_ = 0;
@@ -316,7 +357,15 @@ void ConeDetection::cone_detection_callback(
 #endif
     }
 
+    // Keep the input stamp: downstream nodes and the benchmark can then
+    // compute sensor-to-output latency.
+    cone_array_msg.header = image_msg->header;
+    stats.published_cones = cone_array_msg.cone_array.size();
     detected_cones_publisher_->publish(cone_array_msg);
+    stats.callback_total_us = std::chrono::duration_cast<std::chrono::microseconds>(
+        BenchClock::now() - callback_start).count();
+    write_benchmark_row(image_msg->header, stats);
+    write_detections(image_msg->header, last_results_);
 
 #ifndef NDEBUG
     // Convert CV image to ROS msg and publish image message with
@@ -333,6 +382,7 @@ std::vector<std::pair<std::string, cv::Rect>> ConeDetection::detect_cones_on_img
     std::vector<std::pair<std::string, cv::Rect>> detected_cones;
     
     std::vector<ModelResult> results = model_->detect(cv_image_ptr->image);
+    last_results_ = results;
 
     for (const auto& result : results) {
         detected_cones.push_back(std::make_pair(
@@ -386,6 +436,7 @@ std::vector<std::pair<std::string, cv::Rect>> ConeDetection::detect_cones_on_img
     std::vector<std::pair<std::string, cv::Rect>> detected_cones;
     
     std::vector<ModelResult> results = model_->detect(cuda_image);
+    last_results_ = results;
 
     for (const auto& result : results) {
         detected_cones.push_back(std::make_pair(
@@ -708,6 +759,95 @@ pcl::PointCloud<pcl::PointXYZ>::Ptr ConeDetection::interp_point_cloud(
     }
 
     return interpolated_point_cloud;
+}
+
+void ConeDetection::init_benchmark() {
+    const std::string csv_path =
+        this->declare_parameter<std::string>("benchmark.csv_path", "");
+    const std::string detections_path =
+        this->declare_parameter<std::string>("benchmark.detections_csv_path", "");
+    benchmark_warmup_frames_ =
+        this->declare_parameter<int>("benchmark.warmup_frames", 20);
+    const std::string label =
+        this->declare_parameter<std::string>("benchmark.label", "");
+
+    if (!csv_path.empty()) {
+        benchmark_csv_.open(csv_path, std::ios::out | std::ios::trunc);
+        if (!benchmark_csv_) {
+            RCLCPP_ERROR(this->get_logger(), "Cannot open benchmark CSV: %s", csv_path.c_str());
+        } else {
+            // Run metadata as comment lines; pandas: read_csv(comment='#')
+            benchmark_csv_ << "# label=" << label << "\n"
+                           << "# backend=" << model_->backend() << "\n"
+                           << "# precision=" << precisionToString(model_->precision()) << "\n"
+                           << "# engine=" << model_->modelPath() << "\n"
+                           << "# runtime=" << model_->runtimeVersion() << "\n"
+#ifdef NDEBUG
+                           << "# build=release\n"
+#else
+                           << "# build=debug\n"
+#endif
+                           << "# warmup_frames=" << benchmark_warmup_frames_ << "\n";
+            benchmark_csv_ << "frame,stamp_ns,upload_us,detection_time_us,model_total_us,"
+                              "preprocess_us,inference_us,postprocess_us,filter_time_us,"
+                              "fusion_time_us,callback_total_us,raw_cones,filtered_cones,"
+                              "fused_candidates,published_cones\n";
+            RCLCPP_INFO(this->get_logger(), "Benchmark CSV: %s", csv_path.c_str());
+        }
+    }
+    if (!detections_path.empty()) {
+        detections_csv_.open(detections_path, std::ios::out | std::ios::trunc);
+        if (!detections_csv_) {
+            RCLCPP_ERROR(this->get_logger(), "Cannot open detections CSV: %s", detections_path.c_str());
+        } else {
+            detections_csv_ << "frame,stamp_ns,class_id,class_name,confidence,x,y,w,h\n";
+        }
+    }
+}
+
+void ConeDetection::write_benchmark_row(
+    const std_msgs::msg::Header &image_header,
+    const FrameStats &stats
+) {
+    const int64_t frame = frame_index_++;
+    if (!benchmark_csv_.is_open() || frame < benchmark_warmup_frames_) {
+        return;
+    }
+    const ModelTimings &t = model_->lastTimings();
+    const int64_t stamp_ns = rclcpp::Time(image_header.stamp).nanoseconds();
+    benchmark_csv_ << frame << ',' << stamp_ns << ','
+                   << stats.upload_us << ',' << stats.detection_time_us << ','
+                   << t.total_us << ',' << t.preprocess_us << ','
+                   << t.inference_us << ',' << t.postprocess_us << ','
+                   << stats.filter_time_us << ',' << stats.fusion_time_us << ','
+                   << stats.callback_total_us << ','
+                   << stats.raw_cones << ',' << stats.filtered_cones << ','
+                   << stats.fused_candidates << ',' << stats.published_cones << '\n';
+    // Flush every 100 rows: data survives Ctrl+C without a write per frame
+    if (frame % 100 == 0) {
+        benchmark_csv_.flush();
+    }
+}
+
+void ConeDetection::write_detections(
+    const std_msgs::msg::Header &image_header,
+    const std::vector<ModelResult> &results
+) {
+    // frame_index_ was already incremented by write_benchmark_row()
+    const int64_t frame = frame_index_ - 1;
+    if (!detections_csv_.is_open() || frame < benchmark_warmup_frames_) {
+        return;
+    }
+    const int64_t stamp_ns = rclcpp::Time(image_header.stamp).nanoseconds();
+    for (const auto &r : results) {
+        detections_csv_ << frame << ',' << stamp_ns << ',' << r.class_id << ','
+                        << model_->get_class_by_id(r.class_id) << ',' << r.confidence << ','
+                        << r.box.x << ',' << r.box.y << ',' << r.box.width << ','
+                        << r.box.height << '\n';
+    }
+    if (frame % 100 == 0) {
+        detections_csv_.flush();
+    }
 }
 
 #include "rclcpp_components/register_node_macro.hpp"

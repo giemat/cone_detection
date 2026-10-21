@@ -9,7 +9,12 @@
 #include <Eigen/Dense>
 // Image manipulations, msg<->Image conversion
 #include <opencv2/opencv.hpp>
+// cv_bridge.h is deprecated (Humble) and removed in newer distros
+#if __has_include(<cv_bridge/cv_bridge.hpp>)
+#include <cv_bridge/cv_bridge.hpp>
+#else
 #include <cv_bridge/cv_bridge.h>
+#endif
 // Point cloud manipulations
 #include <pcl/filters/filter.h>
 #include <pcl/filters/extract_indices.h>
@@ -29,13 +34,15 @@
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include "common_msgs/msg/cone_array.hpp"
 #include "common_msgs/msg/cone.hpp"
-// Image detection using a model
-//#include "model_onnx.hpp"
-#include "model_trt.hpp"
+// Image detection using a model (TensorRT or ONNX Runtime backend)
+#include "detector.hpp"
 //From common
 #include "common/cone.hpp"
 #include "common/viz.hpp"
 // Standard
+#include <chrono>
+#include <cstdint>
+#include <fstream>
 #include <limits>
 #include <cmath>
 #include <string>
@@ -49,8 +56,23 @@
 #include <geometry_msgs/msg/vector3.hpp>
 #include <visualization_msgs/msg/marker_array.hpp>
 #include <visualization_msgs/msg/marker.hpp>
-#include <chrono>
 #endif
+
+/**
+ * Per-frame benchmark record. One CSV row per processed frame, same column
+ * names as the cone_detection_summary.csv produced earlier on x86.
+ */
+struct FrameStats {
+    int64_t upload_us = 0;
+    int64_t detection_time_us = 0;
+    int64_t filter_time_us = 0;
+    int64_t fusion_time_us = 0;
+    int64_t callback_total_us = 0;
+    size_t raw_cones = 0;
+    size_t filtered_cones = 0;
+    size_t fused_candidates = 0;
+    size_t published_cones = 0;
+};
 
 /**  */
 struct ConeInfo {
@@ -129,8 +151,10 @@ private:
         const sensor_msgs::msg::Image::ConstSharedPtr &image_msg
     );
 
-    /** Pointer to model instance. */
-    std::shared_ptr<Model> model_;
+    /** Detector (backend selected by the `backend` parameter). */
+    std::unique_ptr<Detector> model_;
+    /** Camera frame on the GPU (release path), reused between frames. */
+    cv::cuda::GpuMat cuda_image_;
 
     /**
      * Detects cones using a model.
@@ -228,6 +252,26 @@ private:
 
     /** The current dynamic event (mission). */
     std::string mission_;
+
+    /** Benchmark output. Disabled when `benchmark.csv_path` is empty. */
+    std::ofstream benchmark_csv_;
+    /** Detections per frame (class, confidence, box) for accuracy comparison. */
+    std::ofstream detections_csv_;
+    /** Frames skipped before logging (engine warm-up, lazy CUDA init). */
+    int64_t benchmark_warmup_frames_ = 0;
+    int64_t frame_index_ = 0;
+    /** Open the benchmark CSV files and write the run header. */
+    void init_benchmark();
+    void write_benchmark_row(
+        const std_msgs::msg::Header &image_header,
+        const FrameStats &stats
+    );
+    void write_detections(
+        const std_msgs::msg::Header &image_header,
+        const std::vector<ModelResult> &results
+    );
+    /** Raw model output of the current frame, kept for detections_csv_. */
+    std::vector<ModelResult> last_results_;
 };
 
 #endif

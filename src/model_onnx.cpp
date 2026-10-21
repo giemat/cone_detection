@@ -1,314 +1,227 @@
 #include "cone_detection/model_onnx.hpp"
 
-Model::Model(const SessionOptions& options, const ModelParams& params) {
-    try {
-        if (params.img_size.at(0) <= 0 || params.img_size.at(1) <= 0) {
-            throw std::invalid_argument(
-                "Model: invalid img size provided in params."
-            );
-        }
+#include <mutex>
+#include <unordered_map>
 
-        // Set options used to construct session
-        Ort::SessionOptions session_options;
-        if (options.cuda_enable) {
-            // And for CUDA if enabled
-            OrtCUDAProviderOptions cuda_options;
-            cuda_options.device_id = 0;
-            session_options.AppendExecutionProvider_CUDA(cuda_options);
-        }
-        session_options.SetGraphOptimizationLevel(
-            GraphOptimizationLevel::ORT_ENABLE_ALL
-        );
-        session_options.SetIntraOpNumThreads(options.intra_op_num_threads);
-        session_options.SetLogSeverityLevel(options.log_severity_level);
-
-        // Set passed params to class member params_
-        params_ = params;
-        // Create OrtEnv object with setted logging level
-        env_ = Ort::Env(ORT_LOGGING_LEVEL_WARNING, "Model");
-        // Create session from a model file with options
-        session_ = std::make_unique<Ort::Session>(
-            env_,
-            params_.model_path.c_str(),
-            session_options
-        );
-        // Create RunOptions object
-        options_ = Ort::RunOptions{ nullptr };
-
-        // Allocate memory for blob
-        blob = std::make_unique<float[]>(params_.img_size.at(0) * params_.img_size.at(1) * 3);
-
-        get_node_names();
-        warm_up();
-    }
-    catch (const std::exception& e) {
-        RCLCPP_ERROR(
-            rclcpp::get_logger("cone_detection"),
-            "Model: %s", e.what()
-        );
-    }
+namespace {
+rclcpp::Logger logger() {
+    return rclcpp::get_logger("cone_detection");
 }
 
-std::vector<ModelResult> Model::detect(const cv::Mat& img) {
-    std::vector<ModelResult> res{};
-
-    if (img.empty() || img.rows == 0 || img.cols == 0) {
-        RCLCPP_ERROR(
-            rclcpp::get_logger("cone_detection"),
-            "detect: input img is empty or has zero dims."
-        );
-        return res;
+std::string shapeToString(const std::vector<int64_t> &shape) {
+    std::string s = "[";
+    for (size_t i = 0; i < shape.size(); ++i) {
+        s += (i ? ", " : "") + std::to_string(shape[i]);
     }
-
-    try {
-        cv::Mat processed_img = letterboxing(img);
-        blob_from_image(processed_img);
-        auto output_tensors = create_tensor_and_run();
-        res = process_output_tensors(output_tensors);
-    }
-    catch (const std::exception& e) {
-        RCLCPP_ERROR(
-            rclcpp::get_logger("cone_detection"),
-            "detect: %s", e.what()
-        );
-    }
-
-    return res;
+    return s + "]";
 }
 
-void Model::blob_from_image(const cv::Mat& img) {
-    int channels = img.channels();
-    int height = img.rows;
-    int width = img.cols;
-    // Pointer to the raw data of the img
-    // Same as uchar* from OpenCV docs
-    const uint8_t* img_data = img.data;
-
-    // The order matters because of cv::Mat memory layout!
-    // Changing the order of loops slow down this function!
-    for (int c = 0; c < channels; c++) {
-        for (int h = 0; h < height; h++) {
-            for (int w = 0; w < width; w++) {
-                // Direct access to the pixel data
-                blob[c * width * height + h * width + w] =
-                    img_data[(h * width + w) * channels + c] / 255.0f;
-            }
-        }
+size_t elementCount(const std::vector<int64_t> &shape) {
+    size_t n = 1;
+    for (int64_t d : shape) {
+        n *= static_cast<size_t>(d);
     }
+    return n;
 }
 
-std::vector<Ort::Value> Model::create_tensor_and_run() {
-    // Create a vector of tensor dimensions of the input node
-    std::vector<int64_t> input_node_dims =
-        { 1, 3, params_.img_size.at(0), params_.img_size.at(1) };
-    
-    // Create a tensor
-    Ort::Value input_tensor = Ort::Value::CreateTensor<float>(
-            Ort::MemoryInfo::CreateCpu(OrtDeviceAllocator, OrtMemTypeCPU),
-            blob.get(),
-            3 * params_.img_size.at(0) * params_.img_size.at(1),
-            input_node_dims.data(),
-            input_node_dims.size()
-        );
+constexpr const char *kPluginRegistrationName = "cone_detection_cuda_plugin";
+constexpr const char *kCudaEpName = "CUDAExecutionProvider";
+// Where Dockerfile.jetpack unpacks the CUDA plugin EP on aarch64
+constexpr const char *kDefaultPluginPath = "/opt/onnxruntime/plugin-ep-cuda/libonnxruntime_providers_cuda.so";
+}  // namespace
 
-    // Run the model in a session with our options and data
-    auto output_tensors = session_->Run(
-        options_,
-        input_node_names_.data(),
-        &input_tensor,
-        1,
-        output_node_names_.data(),
-        output_node_names_.size()
-    );
+namespace {
+std::mutex g_envMutex;
+std::weak_ptr<Ort::Env> g_env;
+// Plugin EP libraries are registered per Env
+bool g_pluginRegistered = false;
+}  // namespace
 
-    return output_tensors;
+std::shared_ptr<Ort::Env> OnnxModel::sharedEnv() {
+    std::lock_guard<std::mutex> lock(g_envMutex);
+    std::shared_ptr<Ort::Env> env = g_env.lock();
+    if (!env) {
+        env = std::make_shared<Ort::Env>(ORT_LOGGING_LEVEL_WARNING, "cone_detection");
+        g_env = env;
+        g_pluginRegistered = false;
+    }
+    return env;
 }
 
-void Model::get_node_names() {
-    // Memory allocator with default options
+OnnxModel::OnnxModel(const ModelParams &params) : Detector(params) {
+    switch (m_config.precision) {
+        case Precision::FP32: m_modelPath = params.onnxModelPath; break;
+        case Precision::FP16: m_modelPath = params.onnxFp16ModelPath; break;
+        case Precision::INT8: m_modelPath = params.onnxInt8ModelPath; break;
+    }
+    if (m_modelPath.empty()) {
+        throw std::runtime_error("No ONNX model configured for precision " + precisionToString(m_config.precision) +
+                                 " (model_path / onnx.fp16_model_path / onnx.int8_model_path)");
+    }
+    if (!ConeUtil::doesFileExist(m_modelPath)) {
+        throw std::runtime_error("ONNX model not found: " + m_modelPath +
+                                 ". fp16/int8 files are made by scripts/benchmark/export_onnx_variants.py");
+    }
+#if defined(__aarch64__)
+    // The aarch64 ONNX Runtime package is CPU only: use the plugin by default
+    if (m_config.onnxCudaPluginPath.empty() && ConeUtil::doesFileExist(kDefaultPluginPath)) {
+        m_config.onnxCudaPluginPath = kDefaultPluginPath;
+    }
+#endif
+    m_usePlugin = !m_config.onnxCudaPluginPath.empty();
+
+    // The Env registers ONNX Runtime's default logger; it must exist before
+    // any other ORT object (CUDA provider options fail without it).
+    m_env = sharedEnv();
+    Ort::SessionOptions options;
+    options.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
+    options.SetIntraOpNumThreads(params.onnxIntraOpThreads);
+    options.SetLogSeverityLevel(ORT_LOGGING_LEVEL_WARNING);
+    if (params.onnxDisableCpuFallback) {
+        options.AddConfigEntry("session.disable_cpu_ep_fallback", "1");
+    }
+    appendCudaExecutionProvider(options);
+
+    RCLCPP_INFO(logger(), "ONNX Runtime %s (%s), precision %s, model %s", Ort::GetVersionString().c_str(),
+                m_usePlugin ? "CUDA plugin EP" : "CUDA EP", precisionToString(m_config.precision).c_str(),
+                m_modelPath.c_str());
+    m_session = std::make_unique<Ort::Session>(*m_env, m_modelPath.c_str(), options);
+
+    if (m_session->GetInputCount() != 1 || m_session->GetOutputCount() < 1) {
+        throw std::runtime_error("ONNX model must have one input and at least one output");
+    }
     Ort::AllocatorWithDefaultOptions allocator;
+    m_inputName = m_session->GetInputNameAllocated(0, allocator).get();
+    m_outputName = m_session->GetOutputNameAllocated(0, allocator).get();
 
-    // Get number of input and output nodes
-    size_t input_nodes_num = session_->GetInputCount();
-    size_t output_nodes_num = session_->GetOutputCount();
-
-    // Get input node names
-    for (size_t node_num = 0; node_num < input_nodes_num; node_num++) {
-        Ort::AllocatedStringPtr input_node_name =
-            session_->GetInputNameAllocated(node_num, allocator);
-        /**
-         * @todo We need "Array of null terminated UTF8 encoded
-         * strings of the output names" for ONNX Runtime
-         * 
-         * case 1:
-         * input_node_names_.push_back(input_node_name.get());
-         * The memory is cleared after leaving input_node_name
-         * go out of scope.
-         * 
-         * case 2:
-         * std::string temp_str(input_node_name.get());
-         * input_node_names_.push_back(temp_str.c_str());
-         * c_str() return pointer on string buffer.
-         * No string = no memory.
-         * 
-         * case 3:
-         * char* temp_buf = new char[50]; <- we set buffer size here!!!
-         * This memory never cleared, so it works.
-         */
-        char* temp_buf = new char[50];
-        strcpy(temp_buf, input_node_name.get());
-        input_node_names_.push_back(temp_buf);
+    // Input [1, 3, H, W] float. FP16 models must keep float32 I/O
+    // (convert_float_to_float16(keep_io_types=True)), so the blob is the same.
+    // Keep the TypeInfo alive: the shape info is a view into it
+    const Ort::TypeInfo inputType = m_session->GetInputTypeInfo(0);
+    const auto inputInfo = inputType.GetTensorTypeAndShapeInfo();
+    if (inputInfo.GetElementType() != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
+        throw std::runtime_error("ONNX model input must be float32 (export FP16 models with keep_io_types=True)");
     }
-
-    // Get output node names
-    for (size_t node_num = 0; node_num < output_nodes_num; node_num++) {
-        Ort::AllocatedStringPtr output_node_name =
-            session_->GetOutputNameAllocated(node_num, allocator);
-        char* temp_buf = new char[50];
-        strcpy(temp_buf, output_node_name.get());
-        output_node_names_.push_back(temp_buf);
+    m_inputShape = inputInfo.GetShape();
+    if (m_inputShape.size() != 4 || (m_inputShape[1] != 3 && m_inputShape[1] > 0)) {
+        throw std::runtime_error("ONNX model input must be [N, 3, H, W], got " + shapeToString(m_inputShape));
     }
+    // Dynamic dimensions: batch 1, size from params.yaml (width, height)
+    m_inputShape[0] = 1;
+    m_inputShape[1] = 3;
+    if (m_inputShape[2] <= 0) m_inputShape[2] = params.img_size.at(1);
+    if (m_inputShape[3] <= 0) m_inputShape[3] = params.img_size.at(0);
+    m_inputCount = elementCount(m_inputShape);
+
+    const Ort::TypeInfo outputType = m_session->GetOutputTypeInfo(0);
+    const auto outputInfo = outputType.GetTensorTypeAndShapeInfo();
+    if (outputInfo.GetElementType() != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
+        throw std::runtime_error("ONNX model output must be float32 (export FP16 models with keep_io_types=True)");
+    }
+    m_outputShape = outputInfo.GetShape();
+    if (m_outputShape.size() != 3 || m_outputShape[1] <= 0 || m_outputShape[2] <= 0) {
+        throw std::runtime_error("ONNX model output must be a static [1, 4 + classes, N], got " +
+                                 shapeToString(m_outputShape));
+    }
+    m_outputShape[0] = 1;
+    m_outputCount = elementCount(m_outputShape);
+
+    setInputSize(static_cast<int>(m_inputShape[2]), static_cast<int>(m_inputShape[3]));
+    setOutputShape(static_cast<int32_t>(m_outputShape[1]), static_cast<int32_t>(m_outputShape[2]));
+
+    m_hostMemInfo = Ort::MemoryInfo::CreateCpu(OrtDeviceAllocator, OrtMemTypeDefault);
+    m_binding = std::make_unique<Ort::IoBinding>(*m_session);
+    // Run() synchronises the EP before returning (default run option), so
+    // the host output is complete when infer() returns, as for TensorRT.
+    m_runOptions = Ort::RunOptions{};
+
+    warmUp();
 }
 
-cv::Mat Model::letterboxing(const cv::Mat& img) {
-    cv::Mat res_img;
-
-    // Convert to RGB color space
-    if (img.channels() == 3) {
-        res_img = img.clone();
-        cv::cvtColor(res_img, res_img, cv::COLOR_BGR2RGB);
-    }
-    else {
-        cv::cvtColor(img, res_img, cv::COLOR_GRAY2RGB);
-    }
-
-    // Letter-boxing itself
-    if (img.cols >= img.rows) {
-        // img_size is checked at model initialization!
-        // img.cols is checked in detect function that calls letterboxing!
-        resize_scale_ = img.cols / (float)params_.img_size.at(0);
-        cv::resize(
-            res_img,
-            res_img,
-            cv::Size(params_.img_size.at(0), int(img.rows / resize_scale_))
-        );
-    }
-    else {
-        // img_size is checked at model initialization!
-        // img.rows is checked in detect function that calls letterboxing!
-        resize_scale_ = img.rows / (float)params_.img_size.at(1);
-        cv::resize(
-            res_img,
-            res_img,
-            cv::Size(int(img.cols / resize_scale_), params_.img_size.at(1))
-        );
+void OnnxModel::appendCudaExecutionProvider(Ort::SessionOptions &options) {
+    const std::string &algo = m_config.onnxCudnnConvAlgoSearch;
+    if (!m_usePlugin) {
+        // Classic CUDA EP, part of the onnxruntime-linux-x64-gpu build
+        Ort::CUDAProviderOptions cuda;
+        cuda.Update({
+            {"device_id", "0"},
+            // EXHAUSTIVE: benchmark cuDNN conv algorithms once, the
+            // counterpart of the TensorRT tactic search
+            {"cudnn_conv_algo_search", algo},
+            {"do_copy_in_default_stream", "1"},
+        });
+        options.AppendExecutionProvider_CUDA_V2(*cuda);
+        m_ownedDeviceMemInfo = Ort::MemoryInfo("Cuda", OrtDeviceAllocator, 0, OrtMemTypeDefault);
+        m_deviceMemInfo = m_ownedDeviceMemInfo;
+        return;
     }
 
-    cv::Mat temp_img =
-        cv::Mat::zeros(params_.img_size.at(0), params_.img_size.at(1), CV_8UC3);
-    res_img.copyTo(temp_img(cv::Rect(0, 0, res_img.cols, res_img.rows)));
-    res_img = std::move(temp_img);
-    // Letter-boxing end
-
-    return res_img;
-}
-
-std::vector<ModelResult> Model::process_output_tensors(
-    std::vector<Ort::Value>& output_tensors
-) const {
-    // Get the type and shape of output tensors
-    Ort::TypeInfo type_info = output_tensors.front().GetTypeInfo();
-    auto tensor_info = type_info.GetTensorTypeAndShapeInfo();
-    // Create a vector of tensor dimensions of the output node and get shape data
-    std::vector<int64_t> output_node_dims = tensor_info.GetShape();
-    // Return a non-const pointer to a tensor contained buffer
-    auto output = output_tensors.front().GetTensorMutableData<float>();
-    
-    //8400
-    int stride_num = output_node_dims[1];
-    //84
-    int signal_result_num = output_node_dims[2];
-
-    std::vector<int> class_ids;
-    std::vector<float> confidences;
-    std::vector<cv::Rect> boxes;
-    
-    cv::Mat raw_data = cv::Mat(stride_num, signal_result_num, CV_32F, output);
-    /**
-     * @note Ultralytics add transpose operator to the output of yolov8
-     * model.which make yolov8/v5/v7 has same shape.
-     * @see https://github.com/ultralytics/assets/releases/download/v8.2.0/yolov8n.pt
-     */
-    raw_data = raw_data.t(); // added
-    float* data = (float*)raw_data.data;
-
-    // strideNum -> signalResultNum
-    for (int i = 0; i < signal_result_num; ++i) {
-        float* classes_scores = data + 4;
-        cv::Mat scores(1, params_.classes.size(), CV_32FC1, classes_scores);
-        cv::Point class_id;
-        double max_class_score;
-        cv::minMaxLoc(scores, 0, &max_class_score, 0, &class_id);
-        if (max_class_score > params_.rect_confidence_threshold) {
-            confidences.push_back(max_class_score);
-            class_ids.push_back(class_id.x);
-            float x = data[0];
-            float y = data[1];
-            float w = data[2];
-            float h = data[3];
-
-            int left = int((x - 0.5 * w) * resize_scale_);
-            int top = int((y - 0.5 * h) * resize_scale_);
-
-            int width = int(w * resize_scale_);
-            int height = int(h * resize_scale_);
-
-            boxes.push_back(cv::Rect(left, top, width, height));
+    // CUDA plugin EP (aarch64). Registered once on the shared Env.
+    {
+        std::lock_guard<std::mutex> lock(g_envMutex);
+        if (!g_pluginRegistered) {
+            RCLCPP_INFO(logger(), "Registering CUDA plugin EP: %s", m_config.onnxCudaPluginPath.c_str());
+            m_env->RegisterExecutionProviderLibrary(kPluginRegistrationName, m_config.onnxCudaPluginPath);
+            g_pluginRegistered = true;
         }
-        // signalResultNum -> strideNum
-        data += stride_num;
     }
 
-    // Performs non maximum suppression given boxes and corresponding scores
-    std::vector<int> nms_res;
-    cv::dnn::NMSBoxes(
-        boxes,
-        confidences,
-        params_.rect_confidence_threshold,
-        params_.iou_threshold,
-        nms_res
-    );
-    
-    std::vector<ModelResult> results{};
-
-    for (size_t i = 0; i < nms_res.size(); ++i) {
-        int idx = nms_res[i];
-        ModelResult res;
-        res.class_id = class_ids[idx];
-        res.confidence = confidences[idx];
-        res.box = boxes[idx];
-        results.push_back(res);
+    std::vector<Ort::ConstEpDevice> selected;
+    for (const auto &device : m_env->GetEpDevices()) {
+        if (std::string(device.EpName()) == kCudaEpName && device.Device().Type() == OrtHardwareDeviceType_GPU) {
+            selected.push_back(device);
+            break;  // first GPU
+        }
     }
-
-    return results;
+    if (selected.empty()) {
+        throw std::runtime_error(std::string("No GPU device for ") + kCudaEpName + " after loading " +
+                                 m_config.onnxCudaPluginPath);
+    }
+    try {
+        options.AppendExecutionProvider_V2(*m_env, selected,
+            std::unordered_map<std::string, std::string>{{"cudnn_conv_algo_search", algo}});
+    } catch (const Ort::Exception &e) {
+        // Option names of the plugin EP are not fixed yet: fall back to its defaults
+        RCLCPP_WARN(logger(), "CUDA plugin EP rejected cudnn_conv_algo_search=%s (%s), using defaults",
+                    algo.c_str(), e.what());
+        options.AppendExecutionProvider_V2(*m_env, selected, std::unordered_map<std::string, std::string>{});
+    }
+    // Memory info of the EP's device memory; owned by the EP device (lives as long as m_env)
+    m_deviceMemInfo = selected.front().GetMemoryInfo(OrtDeviceMemoryType_DEFAULT);
+    if (m_deviceMemInfo == nullptr) {
+        throw std::runtime_error("CUDA plugin EP reports no device memory info");
+    }
 }
 
-void Model::warm_up() {
-    // Create "image" of our sizes with 3 channels
-    cv::Mat img =
-        cv::Mat(cv::Size(params_.img_size.at(0), params_.img_size.at(1)), CV_8UC3);
-    // Preprocess "image"
-    cv::Mat processed_img = letterboxing(img);
-
-    blob_from_image(processed_img);
-
-    create_tensor_and_run();
+std::string OnnxModel::runtimeVersion() const {
+    return "onnxruntime=" + Ort::GetVersionString() + (m_usePlugin ? "+cuda_plugin" : "+cuda");
 }
 
-std::string Model::get_class_by_id(int class_id) {
-    if (class_id < 0 || static_cast<size_t>(class_id) >= params_.classes.size()) {
-        throw std::out_of_range("Invalid class_id");
+bool OnnxModel::infer(const cv::cuda::GpuMat &blob, std::vector<float> &output) {
+    if (blob.empty() || blob.type() != CV_32FC3 || !blob.isContinuous() ||
+        static_cast<size_t>(blob.rows) * blob.cols * blob.channels() != m_inputCount) {
+        RCLCPP_ERROR(logger(), "Input blob does not have the model input size!");
+        return false;
     }
-
-    return params_.classes[class_id];
+    output.resize(m_outputCount);
+    try {
+        // Rebind every frame: the blob pointer may change, the output vector too.
+        // Creating the Ort::Value wrappers allocates nothing on the device.
+        Ort::Value input = Ort::Value::CreateTensor<float>(
+            m_deviceMemInfo, const_cast<float *>(blob.ptr<float>()), m_inputCount,
+            m_inputShape.data(), m_inputShape.size());
+        Ort::Value out = Ort::Value::CreateTensor<float>(
+            m_hostMemInfo, output.data(), m_outputCount, m_outputShape.data(), m_outputShape.size());
+        m_binding->ClearBoundInputs();
+        m_binding->ClearBoundOutputs();
+        m_binding->BindInput(m_inputName.c_str(), input);
+        // Host output: ORT copies device->host inside Run(), like the
+        // cudaMemcpy at the end of TrtModel::infer()
+        m_binding->BindOutput(m_outputName.c_str(), out);
+        m_session->Run(m_runOptions, *m_binding);
+    } catch (const Ort::Exception &e) {
+        RCLCPP_ERROR(logger(), "ONNX Runtime inference failed: %s", e.what());
+        return false;
+    }
+    return true;
 }

@@ -49,9 +49,13 @@ Int8EntropyCalibrator2::Int8EntropyCalibrator2(int32_t batchSize, int32_t inputW
         throw std::runtime_error("There are fewer calibration images than the specified batch size!");
     }
 
-    // Randomize the calibration data
-    auto rd = std::random_device{};
-    auto rng = std::default_random_engine{rd()};
+    // Randomize the calibration data with a fixed seed. directory_iterator
+    // order is unspecified, so sort first. With the same image set and the
+    // same standard library the calibration batches are then identical
+    // between runs (std::shuffle itself is implementation-defined, and
+    // TensorRT calibration is not bit-exact across GPUs).
+    std::sort(m_imgPaths.begin(), m_imgPaths.end());
+    auto rng = std::default_random_engine{42u};
     std::shuffle(std::begin(m_imgPaths), std::end(m_imgPaths), rng);
 }
 
