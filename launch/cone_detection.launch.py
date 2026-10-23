@@ -31,6 +31,7 @@ def generate_launch_description():
     # Benchmark overrides. Empty values keep the params.yaml settings.
     benchmark_args = {
         "model": "Model name in the models/ folder, e.g. Yolov8n1920 (empty = params.yaml paths)",
+        "onnx_disable_cpu_fallback": "ONNX Runtime: true = fail if a node would run on the CPU (empty = params.yaml)",
         "backend": "Inference backend: tensorrt | onnx (empty = params.yaml)",
         "precision": "Engine precision: fp32 | fp16 | int8 (empty = params.yaml)",
         "benchmark_csv": "Per-frame timing CSV path (empty = params.yaml)",
@@ -67,14 +68,19 @@ def generate_launch_description():
         overrides = {"mission": current_mission, "use_sim_time": use_sim_time}
         mapping = {
             "backend": "backend",
+            "onnx_disable_cpu_fallback": "onnx.disable_cpu_fallback",
             "precision": "precision",
             "benchmark_csv": "benchmark.csv_path",
             "detections_csv": "benchmark.detections_csv_path",
             "benchmark_label": "benchmark.label",
         }
+        bool_args = {"onnx_disable_cpu_fallback"}
         for arg, param in mapping.items():
             value = LaunchConfiguration(arg).perform(context)
             if value:
+                # Bool parameters reject the string "true"; string ones the bool
+                if arg in bool_args:
+                    value = value.lower() in ("true", "1")
                 overrides[param] = value
         model = LaunchConfiguration("model").perform(context)
         if model:

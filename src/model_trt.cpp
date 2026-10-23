@@ -7,6 +7,16 @@ rclcpp::Logger logger() {
     return rclcpp::get_logger("cone_detection");
 }
 
+/** "dir/model.engine" + "_x" -> "dir/model_x.engine" */
+std::string insertBeforeExtension(const std::string &path, const std::string &tag) {
+    const auto dot = path.find_last_of('.');
+    const auto slash = path.find_last_of('/');
+    if (dot == std::string::npos || (slash != std::string::npos && dot < slash)) {
+        return path + tag;
+    }
+    return path.substr(0, dot) + tag + path.substr(dot);
+}
+
 /** "model.engine" -> "model_sm110_trt101601.engine" */
 std::string tagEnginePath(const std::string &path) {
     int device = 0;
@@ -15,14 +25,127 @@ std::string tagEnginePath(const std::string &path) {
     ConeUtil::checkCudaErrorCode(cudaGetDeviceProperties(&prop, device));
     const std::string tag = "_sm" + std::to_string(prop.major) + std::to_string(prop.minor) +
                             "_trt" + std::to_string(getInferLibVersion());
-    const auto dot = path.find_last_of('.');
-    const auto slash = path.find_last_of('/');
-    if (dot == std::string::npos || (slash != std::string::npos && dot < slash)) {
-        return path + tag;
+    return insertBeforeExtension(path, tag);
+}
+/**
+ * INT8 calibrator over an image folder. Batch 1 (the engine profile is
+ * fixed to batch 1; TensorRT reads only one image per getBatch() call for
+ * explicit-batch networks), and the same preprocessing as inference via
+ * makeInputBlob(). Base: IInt8MinMaxCalibrator or IInt8EntropyCalibrator2.
+ */
+template <class Base>
+class ImageCalibrator : public Base {
+public:
+    ImageCalibrator(std::vector<std::string> images, int height, int width, std::string cacheFile, std::string inputName)
+        : m_images(std::move(images)), m_height(height), m_width(width), m_cacheFile(std::move(cacheFile)),
+          m_inputName(std::move(inputName)) {}
+
+    int32_t getBatchSize() const noexcept override { return 1; }
+
+    bool getBatch(void *bindings[], char const *names[], int32_t nbBindings) noexcept override {
+        try {
+            while (m_next < m_images.size()) {
+                const std::string &path = m_images[m_next++];
+                cv::Mat img = cv::imread(path, cv::IMREAD_COLOR);
+                if (img.empty()) {
+                    RCLCPP_WARN(logger(), "Calibration: cannot read %s, skipped", path.c_str());
+                    continue;
+                }
+                if (m_next % 100 == 0 || m_next == m_images.size()) {
+                    RCLCPP_INFO(logger(), "Calibration: %zu/%zu images", m_next, m_images.size());
+                }
+                m_gpu.upload(img);
+                makeInputBlob(m_gpu, m_height, m_width, m_blob);
+                // OpenCV CUDA calls above are synchronous (default stream)
+                if (nbBindings < 1 || m_inputName != names[0]) {
+                    RCLCPP_ERROR(logger(), "Calibration: unexpected input binding");
+                    return false;
+                }
+                bindings[0] = m_blob.ptr<float>();
+                return true;
+            }
+        } catch (const std::exception &e) {
+            RCLCPP_ERROR(logger(), "Calibration: %s", e.what());
+        }
+        return false;
     }
-    return path.substr(0, dot) + tag + path.substr(dot);
+
+    void const *readCalibrationCache(std::size_t &length) noexcept override {
+        m_cache.clear();
+        std::ifstream in(m_cacheFile, std::ios::binary);
+        if (in.good()) {
+            m_cache.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+            RCLCPP_INFO(logger(), "Calibration: using cache %s (delete it to recalibrate)", m_cacheFile.c_str());
+        }
+        length = m_cache.size();
+        return m_cache.empty() ? nullptr : m_cache.data();
+    }
+
+    void writeCalibrationCache(void const *ptr, std::size_t length) noexcept override {
+        std::ofstream out(m_cacheFile, std::ios::binary);
+        out.write(static_cast<const char *>(ptr), static_cast<std::streamsize>(length));
+        RCLCPP_INFO(logger(), "Calibration cache written: %s", m_cacheFile.c_str());
+    }
+
+private:
+    std::vector<std::string> m_images;
+    int m_height;
+    int m_width;
+    std::string m_cacheFile;
+    std::string m_inputName;
+    size_t m_next = 0;
+    cv::cuda::GpuMat m_gpu;
+    cv::cuda::GpuMat m_blob;
+    std::vector<char> m_cache;
+};
+
+/**
+ * Module prefix of the YOLOv8 Detect head, taken from the last layer
+ * ("/model.22/Concat_5" -> "/model.22/"). Empty if the names do not follow
+ * the Ultralytics export pattern.
+ */
+std::string detectHeadPrefix(const nvinfer1::INetworkDefinition &network) {
+    if (network.getNbLayers() == 0) return "";
+    const std::string last = network.getLayer(network.getNbLayers() - 1)->getName();
+    if (last.size() < 2 || last[0] != '/') return "";
+    const auto slash = last.find('/', 1);
+    return slash == std::string::npos ? "" : last.substr(0, slash + 1);
+}
+
+/** Detect-head post-processing layer (DFL, box decode, sigmoid, concat), not the per-scale convs. */
+bool isDetectHeadPostprocess(const std::string &name, const std::string &prefix) {
+    return !prefix.empty() && name.rfind(prefix, 0) == 0 &&
+           name.find("/cv2.") == std::string::npos && name.find("/cv3.") == std::string::npos;
 }
 }  // namespace
+
+void TrtModel::keepDetectHeadFp32(nvinfer1::INetworkDefinition &network, nvinfer1::IBuilderConfig &config) {
+    // The YOLOv8 output concatenates box coordinates (0..input size, pixels)
+    // and class scores (0..1). In INT8 they share one scale, so the scores
+    // are rounded to 0 and most detections disappear. Keep the head
+    // post-processing in FP32; the backbone and neck stay INT8.
+    const std::string prefix = detectHeadPrefix(network);
+    int pinned = 0;
+    for (int i = 0; i < network.getNbLayers(); ++i) {
+        nvinfer1::ILayer *layer = network.getLayer(i);
+        if (!isDetectHeadPostprocess(layer->getName(), prefix)) continue;
+        // Shape / constant layers have no precision choice
+        if (layer->getType() == nvinfer1::LayerType::kCONSTANT || layer->getType() == nvinfer1::LayerType::kSHAPE) continue;
+        layer->setPrecision(nvinfer1::DataType::kFLOAT);
+        for (int o = 0; o < layer->getNbOutputs(); ++o) {
+            if (layer->getOutput(o)->getType() == nvinfer1::DataType::kFLOAT) {
+                layer->setOutputType(o, nvinfer1::DataType::kFLOAT);
+            }
+        }
+        ++pinned;
+    }
+    if (pinned == 0) {
+        RCLCPP_WARN(logger(), "int8_keep_head_fp32: no YOLOv8 detect-head layers found, whole network is INT8");
+        return;
+    }
+    config.setFlag(nvinfer1::BuilderFlag::kOBEY_PRECISION_CONSTRAINTS);
+    RCLCPP_INFO(logger(), "INT8: %d detect-head layers (%s*) kept in FP32", pinned, prefix.c_str());
+}
 
 void Logger::log(Severity severity, const char *msg) noexcept {
     // Only log Warnings or more important.
@@ -41,21 +164,40 @@ TrtModel::TrtModel(const ModelParams& params) : Detector(params) {
         throw std::runtime_error("No engine path configured for precision " +
                                  precisionToString(m_config.precision));
     }
+    if (m_config.precision == Precision::INT8) {
+        // Settings that change the INT8 engine go into its name, so an A/B
+        // run never reuses an engine (or calibration cache, named after the
+        // engine) built with other settings: "_minmax_n1000" / "_entropy_n300_headint8"
+        std::string tag = "_" + m_config.calibrationAlgorithm + "_n" + std::to_string(m_config.calibrationMaxImages);
+        if (!m_config.int8KeepHeadFp32) tag += "_headint8";
+        m_config.enginePath = insertBeforeExtension(m_config.enginePath, tag);
+    }
     if (m_config.tagEngineWithPlatform) {
         m_config.enginePath = tagEnginePath(m_config.enginePath);
     }
     RCLCPP_INFO(logger(), "TensorRT %d, precision %s, engine %s", getInferLibVersion(),
                 precisionToString(m_config.precision).c_str(), m_config.enginePath.c_str());
 
-    if (!loadEngine()) {
-        if (!buildEngine()) {
-            throw std::runtime_error("Failed to build and load engine.");
+    // The destructor does not run when the constructor throws: free the
+    // output buffers and the stream here on failure.
+    try {
+        if (!loadEngine()) {
+            if (!buildEngine()) {
+                throw std::runtime_error("Failed to build and load engine.");
+            }
         }
-    }
 
-    // Create the cuda stream that will be used for inference
-    ConeUtil::checkCudaErrorCode(cudaStreamCreate(&inferenceCudaStream));
-    warmUp();
+        // Create the cuda stream that will be used for inference
+        ConeUtil::checkCudaErrorCode(cudaStreamCreate(&inferenceCudaStream));
+        warmUp();
+    } catch (...) {
+        try { clearGpuBuffers(); } catch (...) {}
+        if (inferenceCudaStream) {
+            cudaStreamDestroy(inferenceCudaStream);
+            inferenceCudaStream = nullptr;
+        }
+        throw;
+    }
 }
 
 TrtModel::~TrtModel() {
@@ -277,13 +419,33 @@ bool TrtModel::buildEngine() {
 
             const nvinfer1::ITensor* input = network->getInput(0);
             const nvinfer1::Dims inputDims = input->getDimensions();
-            // Calibration cache next to the engine. Delete it to recalibrate.
-            const std::string calibrationFileName = m_config.enginePath + ".calibration";
-
-            m_calibrator = std::make_unique<Int8EntropyCalibrator2>(m_config.calibrationBatchSize, inputDims.d[3], inputDims.d[2],
-                                                                    m_config.calibrationDataPath, calibrationFileName, input->getName(),
-                                                                    m_subVals, m_divVals, m_normalize);
+            std::vector<std::string> images = calibrationImages(
+                m_config.calibrationDataPath, static_cast<size_t>(std::max(0, m_config.calibrationMaxImages)));
+            if (images.empty()) {
+                RCLCPP_ERROR(logger(), "No calibration images in %s", m_config.calibrationDataPath.c_str());
+                return false;
+            }
+            // Calibration cache next to the engine; the engine name already
+            // holds algorithm and image count. Delete it to recalibrate.
+            const std::string cacheFile = m_config.enginePath + ".calibration";
+            RCLCPP_INFO(logger(), "INT8 calibration: %s, %zu images from %s", m_config.calibrationAlgorithm.c_str(),
+                        images.size(), m_config.calibrationDataPath.c_str());
+            if (m_config.calibrationAlgorithm == "minmax") {
+                m_calibrator = std::make_unique<ImageCalibrator<nvinfer1::IInt8MinMaxCalibrator>>(
+                    std::move(images), inputDims.d[2], inputDims.d[3], cacheFile, input->getName());
+            } else if (m_config.calibrationAlgorithm == "entropy") {
+                m_calibrator = std::make_unique<ImageCalibrator<nvinfer1::IInt8EntropyCalibrator2>>(
+                    std::move(images), inputDims.d[2], inputDims.d[3], cacheFile, input->getName());
+            } else {
+                RCLCPP_ERROR(logger(), "calibration_algorithm must be minmax or entropy, got %s",
+                             m_config.calibrationAlgorithm.c_str());
+                return false;
+            }
             config->setInt8Calibrator(m_calibrator.get());
+
+            if (m_config.int8KeepHeadFp32) {
+                keepDetectHeadFp32(*network, *config);
+            }
             break;
         }
     }

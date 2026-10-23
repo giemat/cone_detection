@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <filesystem>
 
 namespace {
 using Clock = std::chrono::steady_clock;
@@ -209,6 +210,7 @@ std::vector<ModelResult> Detector::detect(const cv::Mat &inputImage) {
         gpuImg.upload(inputImage);
     } catch (const cv::Exception &e) {
         RCLCPP_ERROR(logger(), "Error uploading image to GPU: %s", e.what());
+        m_timings = ModelTimings{};
         ret.clear();
         return ret;
     }
@@ -233,7 +235,14 @@ std::vector<ModelResult> Detector::detect(const cv::cuda::GpuMat &gpuImg) {
     const auto t0 = Clock::now();
     preprocess(gpuImg);
     const auto t1 = Clock::now();
-    const bool succ = infer(blob, m_featureVector);
+    // A backend may throw (CUDA / ONNX Runtime error). Skip the frame
+    // instead of letting the exception escape the subscriber callback.
+    bool succ = false;
+    try {
+        succ = infer(blob, m_featureVector);
+    } catch (const std::exception &e) {
+        RCLCPP_ERROR(logger(), "Inference error: %s", e.what());
+    }
     const auto t2 = Clock::now();
 
     if (succ) {
@@ -259,8 +268,8 @@ std::string Detector::get_class_by_id(int class_id) const {
     return m_config.classes[class_id];
 }
 
-cv::cuda::GpuMat Detector::resizeKeepAspectRatioPadRightBottom(const cv::cuda::GpuMat &input, size_t height, size_t width,
-                                                               const cv::Scalar &bgcolor) {
+cv::cuda::GpuMat resizeKeepAspectRatioPadRightBottom(const cv::cuda::GpuMat &input, size_t height, size_t width,
+                                                     const cv::Scalar &bgcolor) {
     float r = std::min(width / (input.cols * 1.0), height / (input.rows * 1.0));
     int unpad_w = r * input.cols;
     int unpad_h = r * input.rows;
@@ -269,4 +278,43 @@ cv::cuda::GpuMat Detector::resizeKeepAspectRatioPadRightBottom(const cv::cuda::G
     cv::cuda::GpuMat out(height, width, CV_8UC3, bgcolor);
     re.copyTo(out(cv::Rect(0, 0, re.cols, re.rows)));
     return out;
+}
+
+void makeInputBlob(const cv::cuda::GpuMat &bgr, int height, int width, cv::cuda::GpuMat &blob) {
+    cv::cuda::GpuMat rgb;
+    cv::cuda::cvtColor(bgr, rgb, cv::COLOR_BGR2RGB);
+    if (rgb.rows != height || rgb.cols != width) {
+        rgb = resizeKeepAspectRatioPadRightBottom(rgb, height, width, cv::Scalar(0, 0, 0));
+    }
+    const size_t plane = static_cast<size_t>(height) * width;
+    cv::cuda::GpuMat planar(1, static_cast<int>(plane), CV_8UC3);
+    std::vector<cv::cuda::GpuMat> channels = {
+        cv::cuda::GpuMat(height, width, CV_8U, planar.ptr()),
+        cv::cuda::GpuMat(height, width, CV_8U, planar.ptr() + plane),
+        cv::cuda::GpuMat(height, width, CV_8U, planar.ptr() + 2 * plane),
+    };
+    cv::cuda::split(rgb, channels);
+    planar.convertTo(blob, CV_32FC3, 1.f / 255.f);
+}
+
+std::vector<std::string> calibrationImages(const std::string &dir, size_t maxImages) {
+    std::vector<std::string> all;
+    for (const auto &entry : std::filesystem::directory_iterator(dir)) {
+        if (!entry.is_regular_file()) continue;
+        std::string ext = entry.path().extension().string();
+        std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return std::tolower(c); });
+        if (ext == ".jpg" || ext == ".jpeg" || ext == ".png" || ext == ".bmp") {
+            all.push_back(entry.path().string());
+        }
+    }
+    std::sort(all.begin(), all.end());
+    if (maxImages == 0 || all.size() <= maxImages) {
+        return all;
+    }
+    std::vector<std::string> picked;
+    picked.reserve(maxImages);
+    for (size_t i = 0; i < maxImages; ++i) {
+        picked.push_back(all[i * all.size() / maxImages]);
+    }
+    return picked;
 }

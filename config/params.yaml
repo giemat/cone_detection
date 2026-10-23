@@ -21,9 +21,15 @@
         use_fp16: false
         # INT8 build: also enable FP16 kernels for layers without INT8 support
         int8_fp16_fallback: false
-        # Images per calibration batch (GPU memory: batch * 3 * W * H * 4 B;
-        # 64 at 1280x1280 = 1.3 GB). Lower it on modules with little memory.
-        calibration_batch_size: 64
+        # INT8 build: keep the YOLOv8 detect head (box decode, sigmoid, output
+        # concat) in FP32. false = whole network INT8 (scores collapse to 0)
+        int8_keep_head_fp32: true
+        # INT8 calibration: "minmax" or "entropy" (TensorRT EntropyCalibrator2;
+        # loses YOLOv8 class scores, see docs/JETSON.md). Images are taken
+        # evenly from the sorted calibration folder, the same rule as
+        # scripts/benchmark/export_onnx_variants.py (0 = all images).
+        calibration_algorithm: "minmax"
+        calibration_max_images: 1000
         # Engine names get "_sm<cc>_trt<version>" appended, so x86 and Jetson
         # engines can live in the same models/ folder.
         tag_engine_with_platform: true

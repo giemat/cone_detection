@@ -71,11 +71,20 @@ typedef struct {
     std::string fp32EnginePath;
     std::string quantizedEnginePath;
     std::string calibrationDataPath;
-    int32_t calibrationBatchSize = 64;
+    /** INT8 calibrator: "minmax" (IInt8MinMaxCalibrator) or "entropy" (IInt8EntropyCalibrator2). */
+    std::string calibrationAlgorithm = "minmax";
+    /** Calibration images, evenly spread over the sorted folder (0 = all). Same rule as export_onnx_variants.py. */
+    int calibrationMaxImages = 1000;
     /** Legacy flag: true -> FP16, false -> INT8. Ignored when precision is set. */
     bool useFP16 = false;
     /** INT8 build: also allow FP16 kernels for layers without INT8 support. */
     bool int8Fp16Fallback = false;
+    /**
+     * INT8 build: keep the YOLOv8 detect-head post-processing (DFL, box
+     * decode, sigmoid, output concat) in FP32. Without it the shared INT8
+     * scale of boxes (pixels) and scores (0..1) zeroes the scores.
+     */
+    bool int8KeepHeadFp32 = true;
     /**
      * Append "_sm<cc>_trt<version>" to engine file names. Engines are only
      * valid for the GPU + TensorRT version that built them, so this keeps x86
@@ -173,8 +182,6 @@ private:
     void preprocess(const cv::cuda::GpuMat &gpuImg);
     void blobFromGpuMat(const cv::cuda::GpuMat &input);
     void postprocessDetect(std::vector<float> &featureVector);
-    cv::cuda::GpuMat resizeKeepAspectRatioPadRightBottom(const cv::cuda::GpuMat &input, size_t height, size_t width,
-                                                         const cv::Scalar &bgcolor = cv::Scalar(0, 0, 0));
 
     ModelTimings m_timings;
 
@@ -206,6 +213,25 @@ private:
     int32_t numAnchors = 0;
     size_t numClasses = 0;
 };
+
+/**
+ * Calibration image list: .jpg/.jpeg/.png/.bmp files directly in `dir`,
+ * sorted by path, then `maxImages` of them evenly spread (index
+ * floor(i * N / maxImages)); 0 = all. scripts/benchmark/export_onnx_variants.py
+ * uses the same rule, so TensorRT and ONNX Runtime INT8 see the same images.
+ */
+std::vector<std::string> calibrationImages(const std::string &dir, size_t maxImages);
+
+/** Letterbox resize to height x width, keep aspect ratio, pad right/bottom. */
+cv::cuda::GpuMat resizeKeepAspectRatioPadRightBottom(const cv::cuda::GpuMat &input, size_t height, size_t width,
+                                                     const cv::Scalar &bgcolor = cv::Scalar(0, 0, 0));
+
+/**
+ * BGR image -> 1x3xHxW float blob (RGB, letterbox, /255) in `blob`
+ * (1 x H*W, CV_32FC3, planar). Same steps as Detector::preprocess(); used by
+ * the INT8 calibrator so calibration sees exactly the inference input.
+ */
+void makeInputBlob(const cv::cuda::GpuMat &bgr, int height, int width, cv::cuda::GpuMat &blob);
 
 /** Creates the backend selected by params.backend. */
 std::unique_ptr<Detector> makeDetector(const ModelParams &params);

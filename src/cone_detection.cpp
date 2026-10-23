@@ -71,8 +71,12 @@ ConeDetection::ConeDetection(const rclcpp::NodeOptions &node_options)
         : precisionFromString(precision);
     params.int8Fp16Fallback =
         this->declare_parameter<bool>("int8_fp16_fallback", false);
-    params.calibrationBatchSize = static_cast<int32_t>(
-        this->declare_parameter<int>("calibration_batch_size", 64));
+    params.int8KeepHeadFp32 =
+        this->declare_parameter<bool>("int8_keep_head_fp32", true);
+    params.calibrationAlgorithm =
+        this->declare_parameter<std::string>("calibration_algorithm", "minmax");
+    params.calibrationMaxImages = static_cast<int>(
+        this->declare_parameter<int>("calibration_max_images", 1000));
     params.tagEngineWithPlatform =
         this->declare_parameter<bool>("tag_engine_with_platform", true);
     params.enginePath = this->declare_parameter<std::string>("engine_path");

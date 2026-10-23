@@ -34,10 +34,12 @@ const char *kUsage = R"(Usage: detector_bench --model <fp32.onnx> --images <dir>
   --model PATH              FP32 ONNX model. Derived from it (same folder, same
                             names as the launch file `model:=` argument):
                               TensorRT  <name>_FP32.engine, <name>.engine (fp16),
-                                        <name>_INT8.engine (platform tag appended)
+                                        <name>_INT8_<algo>_n<images>.engine (+ platform tag)
                               ONNX RT   <name>_fp16.onnx, <name>_int8_qdq.onnx
   --engine-dir DIR          where TensorRT engines are read / written (default: model folder)
   --calib DIR               INT8 calibration images (TensorRT int8 build)
+  --calib-algo minmax|entropy  TensorRT INT8 calibrator (default minmax)
+  --calib-images N          calibration images, evenly spread (default 1000, 0 = all)
   --images DIR              .jpg/.png images, processed in sorted order
   --max-images N            0 = all (default)
   --warmup N                frames run before logging (default 20)
@@ -47,6 +49,7 @@ const char *kUsage = R"(Usage: detector_bench --model <fp32.onnx> --images <dir>
   --classes a,b,c           class names (default: the 10 cone classes of params.yaml)
   --conf X / --iou X        thresholds (default 0.25 / 0.5, as params.yaml)
   --cuda-plugin PATH        ONNX Runtime CUDA plugin EP (aarch64)
+  --disable-cpu-fallback 1  ONNX Runtime: fail if any node would run on the CPU
 )";
 
 std::vector<std::string> split(const std::string &s, char sep) {
@@ -67,7 +70,8 @@ std::string stem(const std::string &path) {
 int main(int argc, char **argv) {
     std::map<std::string, std::string> a = {
         {"backend", "tensorrt"}, {"precision", "fp32"}, {"max-images", "0"}, {"warmup", "20"},
-        {"run", "1"}, {"conf", "0.25"}, {"iou", "0.5"},
+        {"run", "1"}, {"conf", "0.25"}, {"iou", "0.5"}, {"disable-cpu-fallback", "0"},
+        {"calib-algo", "minmax"}, {"calib-images", "1000"},
         {"classes", "seg_orange_cone,unknown_cone,yellow_cone,seg_large_orange_cone,seg_blue_cone,"
                     "seg_unknown_cone,seg_yellow_cone,blue_cone,orange_cone,large_orange_cone"},
     };
@@ -99,9 +103,12 @@ int main(int argc, char **argv) {
     p.enginePath = (engineDir / (name + ".engine")).string();
     p.quantizedEnginePath = (engineDir / (name + "_INT8.engine")).string();
     p.calibrationDataPath = a.count("calib") ? a["calib"] : "";
+    p.calibrationAlgorithm = a["calib-algo"];
+    p.calibrationMaxImages = std::stoi(a["calib-images"]);
     p.onnxFp16ModelPath = (dir / (name + "_fp16.onnx")).string();
     p.onnxInt8ModelPath = (dir / (name + "_int8_qdq.onnx")).string();
     p.onnxCudaPluginPath = a.count("cuda-plugin") ? a["cuda-plugin"] : "";
+    p.onnxDisableCpuFallback = a["disable-cpu-fallback"] == "1" || a["disable-cpu-fallback"] == "true";
     p.classes = split(a["classes"], ',');
     p.rect_confidence_threshold = std::stof(a["conf"]);
     p.iou_threshold = std::stof(a["iou"]);
